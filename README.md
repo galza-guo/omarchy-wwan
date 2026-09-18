@@ -62,6 +62,20 @@ omarchy-shell galza.wwan shareOn
 omarchy-shell galza.wwan shareOff
 ```
 
+## Removal
+
+```bash
+omarchy plugin remove galza.wwan
+```
+
+That removes the widget checkout and disables it. It does not delete NetworkManager connections, UFW rules, or `dnsmasq`. To drop the hotspot profile as well:
+
+```bash
+nmcli connection delete "WWAN Share" || true
+```
+
+Leave the gsm profile unless you created it only for this plugin. UFW entries are tagged `WWAN Share` if you want to remove those by hand.
+
 ## License
 
 MIT.
