@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "galza.wwan",
+  "name": "WWAN",
+  "version": "1.2.0",
+  "author": "galza",
+  "license": "MIT",
+  "description": "Cellular modem toggle, signal, and share-this-SIM Wi-Fi hotspot for the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "WWAN",
+    "description": "Show and toggle mobile data, and share it over Wi-Fi",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

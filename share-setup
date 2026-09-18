@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# One-shot root setup for sharing WWAN over Wi-Fi.
+# NetworkManager speaks the AP; this only installs dnsmasq (on Arch) and opens
+# UFW for the 10.42.0.0/24 shared subnet. Do not enable dnsmasq.service —
+# NetworkManager starts its own instance.
+set -euo pipefail
+
+if [[ ${EUID} -ne 0 ]]; then
+  echo "share-setup must run as root (pkexec or sudo)" >&2
+  exit 1
+fi
+
+WIFI_IF=${WIFI_IF:-}
+if [[ -z ${WIFI_IF} ]]; then
+  WIFI_IF=$(nmcli -t -f DEVICE,TYPE device status | awk -F: '$2 == "wifi" && $1 !~ /^p2p-/ { print $1; exit }')
+fi
+[[ -n ${WIFI_IF} ]] || { echo "No Wi-Fi interface" >&2; exit 1; }
+
+if command -v pacman >/dev/null 2>&1; then
+  pacman -S --noconfirm --needed dnsmasq >/dev/null
+fi
+command -v dnsmasq >/dev/null 2>&1 || {
+  echo "dnsmasq is not installed" >&2
+  exit 1
+}
+
+if [[ -f /etc/ufw/sysctl.conf ]]; then
+  SYSCTL=/etc/ufw/sysctl.conf
+  if grep -q '^#net/ipv4/ip_forward=1' "${SYSCTL}"; then
+    sed -i 's/^#net\/ipv4\/ip_forward=1/net\/ipv4\/ip_forward=1/' "${SYSCTL}"
+  elif ! grep -q '^net/ipv4/ip_forward=1' "${SYSCTL}"; then
+    printf '\nnet/ipv4/ip_forward=1\n' >>"${SYSCTL}"
+  fi
+fi
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+
+if command -v ufw >/dev/null 2>&1; then
+  ufw_has() { ufw status | grep -F -- "$1" >/dev/null 2>&1; }
+  if ! ufw_has "WWAN Share DHCP"; then
+    ufw allow in on "${WIFI_IF}" proto udp to any port 67 comment "WWAN Share DHCP" >/dev/null
+  fi
+  if ! ufw_has "WWAN Share DNS UDP"; then
+    ufw allow from 10.42.0.0/24 to 10.42.0.1 port 53 proto udp comment "WWAN Share DNS UDP" >/dev/null
+  fi
+  if ! ufw_has "WWAN Share DNS TCP"; then
+    ufw allow from 10.42.0.0/24 to 10.42.0.1 port 53 proto tcp comment "WWAN Share DNS TCP" >/dev/null
+  fi
+  if ! ufw_has "WWAN Share forward"; then
+    ufw route allow from 10.42.0.0/24 comment "WWAN Share forward" >/dev/null
+  fi
+fi
+
+SLEEP=/usr/lib/systemd/system-sleep/wwan-share
+if [[ ! -f ${SLEEP} ]]; then
+  cat >"${SLEEP}" <<'HOOK'
+#!/bin/bash
+# Drop the AP before sleep so the Wi-Fi radio is not mid-hostapd.
+case "$1" in
+  pre)
+    nmcli -w 4 connection down "WWAN Share" >/dev/null 2>&1 || true
+    ;;
+esac
+exit 0
+HOOK
+  chmod 755 "${SLEEP}"
+fi
+
+echo "WWAN Share setup ready on ${WIFI_IF}"

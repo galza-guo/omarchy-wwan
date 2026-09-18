@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+"""WWAN status, connect/disconnect, recover, and Wi-Fi share for the Omarchy bar."""
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+PREFERRED_CONNECTION = "WWAN"
+SHARE_CONNECTION = "WWAN Share"
+SHARE_ADDR = "10.42.0.1/24"
+SHARE_SETUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "share-setup")
+HARDWARE_NEEDLES = (
+    "xmm7360",
+    "l850",
+    "fibocom",
+    "quectel",
+    "sierra wireless",
+    "dw5821",
+    "em061",
+    "em120",
+    "em160",
+    "fm350",
+    "lte modem",
+    "wwan modem",
+    "mobile broadband",
+)
+
+
+def run(cmd: list[str], timeout: int = 20) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def mmcli_json(args: list[str]) -> dict:
+    proc = run(["mmcli", "--output-json", *args])
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+
+
+def dash(value: object) -> str:
+    text = "" if value is None else str(value).strip()
+    if text in ("", "--"):
+        return ""
+    return text
+
+
+def connection_exists(name: str) -> bool:
+    shown = run(["nmcli", "-t", "-f", "NAME", "connection", "show"])
+    return name in {line.strip() for line in shown.stdout.splitlines()}
+
+
+def gsm_profiles() -> list[str]:
+    proc = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+    names = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and parts[1] in ("gsm", "cdma"):
+            names.append(parts[0])
+    return names
+
+
+def gsm_profile_name() -> str:
+    names = gsm_profiles()
+    if PREFERRED_CONNECTION in names:
+        return PREFERRED_CONNECTION
+    return names[0] if names else ""
+
+
+def nm_active_gsm() -> dict:
+    proc = run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE,STATE", "connection", "show", "--active"])
+    for line in proc.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 4 and parts[1] in ("gsm", "cdma"):
+            return {"name": parts[0], "device": parts[2], "state": parts[3]}
+    return {}
+
+
+def nm_device_state() -> str:
+    proc = run(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])
+    for line in proc.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3 and parts[1] in ("gsm", "cdma"):
+            return parts[2]
+    return ""
+
+
+def hardware_present() -> bool:
+    if any(Path("/dev").glob("wwan*")):
+        return True
+    wwan = Path("/sys/class/wwan")
+    if wwan.is_dir() and any(wwan.iterdir()):
+        return True
+    proc = run(["lspci", "-nn"])
+    blob = proc.stdout.lower()
+    return any(needle in blob for needle in HARDWARE_NEEDLES)
+
+
+def default_share_ssid() -> str:
+    host = socket.gethostname().split(".")[0].strip()
+    return host or "WWAN"
+
+
+def wifi_iface() -> str:
+    proc = run(["nmcli", "-t", "-f", "DEVICE,TYPE", "device", "status"])
+    for line in proc.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and parts[1] == "wifi" and not parts[0].startswith("p2p-"):
+            return parts[0]
+    return ""
+
+
+def share_setup_needed() -> bool:
+    if not shutil.which("dnsmasq"):
+        return True
+    sysctl = Path("/etc/ufw/sysctl.conf")
+    if sysctl.is_file() and "net/ipv4/ip_forward=1" not in [
+        line.strip() for line in sysctl.read_text().splitlines()
+    ]:
+        return True
+    rules = Path("/etc/ufw/user.rules")
+    if rules.is_file() and "10.42.0.0/24" not in rules.read_text():
+        return True
+    return False
+
+
+def run_share_setup() -> str:
+    if not os.access(SHARE_SETUP, os.X_OK):
+        return f"{SHARE_SETUP} is not executable"
+    env = os.environ.copy()
+    iface = wifi_iface()
+    if iface:
+        env["WIFI_IF"] = iface
+    for cmd in (
+        ["pkexec", SHARE_SETUP],
+        ["sudo", "-n", SHARE_SETUP],
+    ):
+        if not shutil.which(cmd[0]):
+            continue
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+        if proc.returncode == 0:
+            return ""
+        err = (proc.stderr or proc.stdout).strip()
+        if "password is required" in err.lower() or "no authentication agent" in err.lower():
+            continue
+        if err:
+            return err
+    return (
+        "Need a one-time admin approval to install dnsmasq and open the "
+        f"firewall for sharing. Run: sudo {SHARE_SETUP}"
+    )
+
+
+def share_password() -> str:
+    proc = run(
+        [
+            "nmcli",
+            "-s",
+            "-g",
+            "802-11-wireless-security.psk",
+            "connection",
+            "show",
+            SHARE_CONNECTION,
+        ]
+    )
+    return proc.stdout.strip()
+
+
+def share_ssid() -> str:
+    proc = run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", SHARE_CONNECTION])
+    ssid = proc.stdout.strip()
+    return ssid or default_share_ssid()
+
+
+def share_clients(iface: str) -> int:
+    if not iface:
+        return 0
+    proc = run(["iw", "dev", iface, "station", "dump"])
+    return sum(1 for line in proc.stdout.splitlines() if line.startswith("Station "))
+
+
+def share_active() -> bool:
+    proc = run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE,STATE", "connection", "show", "--active"])
+    for line in proc.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 4 and parts[0] == SHARE_CONNECTION and parts[3] == "activated":
+            return True
+    return False
+
+
+def empty_share(error: str = "") -> dict:
+    return {
+        "active": False,
+        "ssid": share_ssid() if connection_exists(SHARE_CONNECTION) else default_share_ssid(),
+        "password": "",
+        "clients": 0,
+        "ip": "",
+        "iface": wifi_iface(),
+        "error": error,
+    }
+
+
+def share_status() -> dict:
+    iface = wifi_iface()
+    active = share_active()
+    exists = connection_exists(SHARE_CONNECTION)
+    ip = ""
+    if active and iface:
+        ip_proc = run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", iface])
+        for line in ip_proc.stdout.splitlines():
+            if ":" in line:
+                ip = line.split(":", 1)[1].split("/")[0]
+                break
+    return {
+        "active": active,
+        "ssid": share_ssid() if exists else default_share_ssid(),
+        "password": share_password() if exists else "",
+        "clients": share_clients(iface) if active else 0,
+        "ip": ip,
+        "iface": iface,
+        "error": "",
+    }
+
+
+def profile_apn(name: str) -> str:
+    if not name:
+        return ""
+    proc = run(["nmcli", "-t", "-f", "gsm.apn", "connection", "show", name])
+    for line in proc.stdout.splitlines():
+        if ":" in line:
+            return line.split(":", 1)[1].strip().strip('"')
+    return proc.stdout.strip().strip('"')
+
+
+def offline_status(error: str, state: str = "unresponsive") -> dict:
+    name = gsm_profile_name()
+    return {
+        "present": False,
+        "state": state,
+        "connected": False,
+        "operator": "",
+        "accessTech": "",
+        "signal": 0,
+        "ip": "",
+        "apn": profile_apn(name),
+        "connection": name or PREFERRED_CONNECTION,
+        "registration": "",
+        "deviceState": "",
+        "recoverable": hardware_present(),
+        "error": error,
+        "share": share_status() if connection_exists(SHARE_CONNECTION) else empty_share(),
+    }
+
+
+def status() -> dict:
+    listing = mmcli_json(["-L"])
+    modem_paths = listing.get("modem-list") or []
+    if not modem_paths:
+        raw = run(["mmcli", "-L"])
+        if "/Modem/" not in raw.stdout:
+            if hardware_present():
+                return offline_status(
+                    "Firmware not responding (common after sleep on PCIe LTE cards). "
+                    "Recover restarts ModemManager. If that fails, shut down fully — "
+                    "a reboot often is not enough."
+                )
+            return offline_status("No modem", "missing")
+
+    modem = mmcli_json(["-m", "0"]).get("modem") or {}
+    generic = modem.get("generic") or {}
+    three = modem.get("3gpp") or {}
+    sim = mmcli_json(["-i", "0"]).get("sim", {}).get("properties") or {}
+    quality = generic.get("signal-quality") or {}
+    try:
+        signal = int(quality.get("value") or 0)
+    except (TypeError, ValueError):
+        signal = 0
+
+    techs = generic.get("access-technologies") or generic.get("current") or []
+    if isinstance(techs, str):
+        techs = [techs]
+    access = ""
+    for tech in techs:
+        t = dash(tech).lower()
+        if t and t not in ("--",):
+            access = t
+            break
+
+    active = nm_active_gsm()
+    connected = bool(active) and active.get("state") == "activated"
+    name = active.get("name") or gsm_profile_name() or PREFERRED_CONNECTION
+
+    ip = ""
+    if connected and active.get("device"):
+        ip_proc = run(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", active["device"]])
+        for line in ip_proc.stdout.splitlines():
+            if ":" in line:
+                ip = line.split(":", 1)[1].split("/")[0]
+                break
+
+    state = dash(generic.get("state")) or "unknown"
+    operator = dash(three.get("operator-name")) or dash(sim.get("operator-name"))
+    error = ""
+    if state == "failed":
+        error = dash(generic.get("state-failed-reason")) or "Modem failed"
+    elif state == "locked":
+        error = "SIM PIN required"
+
+    return {
+        "present": True,
+        "state": state,
+        "connected": connected,
+        "operator": operator,
+        "accessTech": access,
+        "signal": signal,
+        "ip": ip,
+        "apn": profile_apn(name),
+        "connection": name,
+        "registration": dash(three.get("registration-state")),
+        "deviceState": nm_device_state(),
+        "recoverable": False,
+        "error": error,
+        "share": share_status(),
+    }
+
+
+def recover_unit_exists() -> bool:
+    for path in (
+        "/etc/systemd/system/l850-gl-recover.service",
+        "/usr/lib/systemd/system/l850-gl-recover.service",
+        "/usr/local/lib/systemd/system/l850-gl-recover.service",
+    ):
+        if os.path.exists(path):
+            return True
+    return False
+
+
+def recover() -> dict:
+    if recover_unit_exists():
+        proc = run(["systemctl", "start", "--wait", "l850-gl-recover.service"], timeout=100)
+    else:
+        proc = run(["mmcli", "-m", "0", "--reset"], timeout=40)
+        if proc.returncode != 0:
+            current = status()
+            current["error"] = (
+                (proc.stderr or proc.stdout).strip()
+                or "Recover failed. Restart ModemManager; if a PCIe modem stays dark, shut down fully."
+            )
+            current["recoverable"] = hardware_present() and not current.get("present")
+            return current
+    result = status()
+    if proc.returncode != 0 and not result.get("present"):
+        err = (proc.stderr or proc.stdout).strip()
+        result["error"] = err or result.get("error") or "Recover failed"
+        result["recoverable"] = True
+    return result
+
+
+def connect() -> dict:
+    current = status()
+    if not current.get("present"):
+        return recover() if current.get("recoverable") else current
+    name = gsm_profile_name()
+    if not name:
+        current["error"] = (
+            "No NetworkManager gsm profile. Create one in nmtui with your carrier APN, then try again."
+        )
+        current["connected"] = False
+        return current
+    run(["nmcli", "radio", "wwan", "on"])
+    proc = run(["nmcli", "-w", "45", "connection", "up", name], timeout=50)
+    result = status()
+    if proc.returncode != 0:
+        result["error"] = (proc.stderr or proc.stdout).strip() or "Connect failed"
+        result["connected"] = False
+        return result
+    if not result.get("connected"):
+        result["error"] = result.get("error") or "Modem did not attach"
+    return result
+
+
+def disconnect() -> dict:
+    run(["nmcli", "-w", "8", "connection", "down", SHARE_CONNECTION], timeout=12)
+    name = gsm_profile_name()
+    proc = run(["nmcli", "-w", "15", "connection", "down", name or PREFERRED_CONNECTION], timeout=20)
+    result = status()
+    if proc.returncode != 0 and "not active" not in (proc.stderr or "").lower():
+        result["error"] = (proc.stderr or proc.stdout).strip() or "Disconnect failed"
+    return result
+
+
+def ensure_share_connection() -> None:
+    iface = wifi_iface()
+    if not iface:
+        raise RuntimeError("No Wi-Fi radio to broadcast from")
+    if connection_exists(SHARE_CONNECTION):
+        proc = run(
+            [
+                "nmcli",
+                "connection",
+                "modify",
+                SHARE_CONNECTION,
+                "connection.interface-name",
+                iface,
+                "connection.autoconnect",
+                "no",
+                "802-11-wireless.mode",
+                "ap",
+                "802-11-wireless.band",
+                "bg",
+                "ipv4.method",
+                "shared",
+                "ipv4.addresses",
+                SHARE_ADDR,
+                "ipv6.method",
+                "disabled",
+            ]
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or "Failed to update the Wi-Fi share")
+        return
+
+    password = secrets.token_urlsafe(10).replace("-", "x").replace("_", "y")
+    ssid = default_share_ssid()
+    proc = run(
+        [
+            "nmcli",
+            "connection",
+            "add",
+            "type",
+            "wifi",
+            "ifname",
+            iface,
+            "con-name",
+            SHARE_CONNECTION,
+            "ssid",
+            ssid,
+            "connection.interface-name",
+            iface,
+            "connection.autoconnect",
+            "no",
+            "802-11-wireless.mode",
+            "ap",
+            "802-11-wireless.band",
+            "bg",
+            "802-11-wireless.channel",
+            "6",
+            "802-11-wireless.cloned-mac-address",
+            "permanent",
+            "802-11-wireless-security.key-mgmt",
+            "wpa-psk",
+            "802-11-wireless-security.psk",
+            password,
+            "802-11-wireless-security.proto",
+            "rsn",
+            "802-11-wireless-security.pairwise",
+            "ccmp",
+            "802-11-wireless-security.group",
+            "ccmp",
+            "ipv4.method",
+            "shared",
+            "ipv4.addresses",
+            SHARE_ADDR,
+            "ipv6.method",
+            "disabled",
+        ]
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or "Failed to create the Wi-Fi share")
+
+
+def share_on() -> dict:
+    current = status()
+    if not current.get("connected"):
+        current = connect()
+        if not current.get("connected"):
+            current.setdefault("share", empty_share())
+            current["share"]["error"] = current.get("error") or "Mobile data must be on before sharing"
+            return current
+    if share_setup_needed():
+        setup_error = run_share_setup()
+        if setup_error:
+            current = status()
+            current["share"]["error"] = setup_error
+            current["error"] = setup_error
+            return current
+    ensure_share_connection()
+    run(["nmcli", "radio", "wifi", "on"])
+    proc = run(["nmcli", "-w", "25", "connection", "up", SHARE_CONNECTION], timeout=30)
+    result = status()
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout).strip() or "Failed to start Wi-Fi share"
+        result["share"]["error"] = err
+        result["error"] = err
+        return result
+    if not result.get("share", {}).get("active"):
+        err = "Wi-Fi share did not come up. Many Intel cards can only start an AP on 2.4 GHz."
+        result["share"]["error"] = err
+        result["error"] = err
+    return result
+
+
+def share_off() -> dict:
+    proc = run(["nmcli", "-w", "12", "connection", "down", SHARE_CONNECTION], timeout=16)
+    result = status()
+    if proc.returncode != 0 and "not active" not in (proc.stderr or "").lower():
+        err = (proc.stderr or proc.stdout).strip() or "Failed to stop Wi-Fi share"
+        result["share"]["error"] = err
+        result["error"] = err
+    return result
+
+
+def main() -> int:
+    action = sys.argv[1] if len(sys.argv) > 1 else "status"
+    try:
+        if action == "status":
+            data = status()
+        elif action == "connect":
+            data = connect()
+        elif action == "disconnect":
+            data = disconnect()
+        elif action == "recover":
+            data = recover()
+        elif action == "share-on":
+            data = share_on()
+        elif action == "share-off":
+            data = share_off()
+        else:
+            print(json.dumps({"present": False, "error": f"unknown action {action}"}))
+            return 2
+        print(json.dumps(data))
+        return 0 if not data.get("error") else 1
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"present": True, "error": "Timed out talking to the modem"}))
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"present": False, "error": str(exc)}))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
